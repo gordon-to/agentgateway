@@ -222,12 +222,10 @@ export async function mockGateway(
 
   await page.route("**/api/config/status", async (route) => {
     await json(route, {
-      state: "synced",
-      appliedGeneration: 1,
-      appliedAt: new Date().toISOString(),
-      appliedHash: "sha256:test",
-      lastAttempt: { at: new Date().toISOString(), error: null },
-      storedMatchesApplied: true,
+      runningHash: "sha256:test",
+      diskHash: "sha256:test",
+      error: null,
+      lastUpdatedAt: new Date().toISOString(),
     });
   });
 

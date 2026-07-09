@@ -138,16 +138,19 @@ function RawConfigEditorPage() {
           {config.error.message}
         </StatusBanner>
       ) : null}
-      {loadStatus.data?.state === "failed" ? (
+      {loadStatus.data?.error ? (
         <StatusBanner
           state="bad"
           title="The gateway failed to load this configuration"
         >
-          {loadStatus.data.lastAttempt?.error ??
-            "The gateway is still running the last successfully applied configuration."}
+          {loadStatus.data.error}
         </StatusBanner>
       ) : null}
-      {loadStatus.data?.state === "drifted" ? (
+      {loadStatus.data &&
+      !loadStatus.data.error &&
+      loadStatus.data.runningHash &&
+      loadStatus.data.diskHash &&
+      loadStatus.data.runningHash !== loadStatus.data.diskHash ? (
         <StatusBanner
           state="warn"
           title="Stored configuration differs from the running configuration"

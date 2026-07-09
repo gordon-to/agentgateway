@@ -70,7 +70,7 @@ struct AdminState {
 	shutdown_trigger: signal::ShutdownTrigger,
 	#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 	dataplane_handle: Handle,
-	load_status: crate::load_status::Watcher,
+	load_status: crate::state_manager::SharedLoadStatus,
 }
 
 pub struct Service {
@@ -91,7 +91,7 @@ pub struct ConfigDump {
 	version: BuildInfo,
 	config: Arc<Config>,
 	#[serde(skip_serializing_if = "Option::is_none")]
-	local_config_status: Option<crate::load_status::Status>,
+	local_config_status: Option<crate::state_manager::LoadStatus>,
 }
 
 #[derive(serde::Serialize, Debug, Clone, Default)]
@@ -120,7 +120,7 @@ impl Service {
 		model_catalog: Arc<crate::llm::cost::ModelCatalog>,
 		stores: crate::store::Stores,
 		resource_manager: crate::resource_manager::ResourceManager,
-		load_status: crate::load_status::Watcher,
+		load_status: crate::state_manager::SharedLoadStatus,
 		shutdown_trigger: signal::ShutdownTrigger,
 		drain_rx: DrainWatcher,
 		dataplane_handle: Handle,
@@ -458,7 +458,7 @@ async fn handle_config_dump(
 	AxumState(state): AxumState<Arc<AdminState>>,
 ) -> Result<Response, AdminError> {
 	let local_config_status = match &state.config.xds.local_config {
-		Some(cfg) => state.load_status.status(cfg).await,
+		Some(cfg) => Some(crate::state_manager::LoadStatus::snapshot(&state.load_status, cfg).await),
 		None => None,
 	};
 	let dump = ConfigDump {

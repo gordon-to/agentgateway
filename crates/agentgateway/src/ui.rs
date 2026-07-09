@@ -30,7 +30,7 @@ struct App {
 	state: Arc<Config>,
 	resource_manager: crate::resource_manager::ResourceManager,
 	model_catalog: Arc<ModelCatalog>,
-	load_status: crate::load_status::Watcher,
+	load_status: crate::state_manager::SharedLoadStatus,
 }
 
 impl App {
@@ -52,14 +52,13 @@ pub fn router(
 	cfg: Arc<Config>,
 	model_catalog: Arc<ModelCatalog>,
 	resource_manager: crate::resource_manager::ResourceManager,
-	load_status: crate::load_status::Watcher,
+	load_status: crate::state_manager::SharedLoadStatus,
 ) -> Router {
 	let ui_service = tower::service_fn(move |req| serve_ui_asset(req, &ASSETS_DIR));
 	Router::new()
 		// Redirect to the UI
 		.route("/api/runtime", get(get_runtime))
 		.route("/api/config", get(get_config).post(write_config))
-		.route("/api/config/live", get(get_config_live))
 		.route("/api/config/status", get(get_config_status))
 		// Legacy path
 		.route("/cel", axum::routing::post(handle_cel))
@@ -189,33 +188,13 @@ async fn get_config(State(app): State<App>) -> Result<Json<Value>, ErrorResponse
 	Ok(Json(v))
 }
 
-async fn get_config_live(State(app): State<App>) -> Result<Json<Value>, ErrorResponse> {
-	let cfg = app.cfg()?;
-	let (applied, status) = app
-		.load_status
-		.live(&cfg)
-		.await
-		.ok_or(ErrorResponse::String("local config not setup".to_string()))?;
-	let config = match applied {
-		Some(raw) => yamlviajson::from_str::<Value>(&raw).map_err(ErrorResponse::Anyhow)?,
-		None => Value::Null,
-	};
-	Ok(Json(serde_json::json!({
-		"config": config,
-		"status": status,
-	})))
-}
-
 async fn get_config_status(
 	State(app): State<App>,
-) -> Result<Json<crate::load_status::Status>, ErrorResponse> {
+) -> Result<Json<crate::state_manager::LoadStatus>, ErrorResponse> {
 	let cfg = app.cfg()?;
-	let status = app
-		.load_status
-		.status(&cfg)
-		.await
-		.ok_or(ErrorResponse::String("local config not setup".to_string()))?;
-	Ok(Json(status))
+	Ok(Json(
+		crate::state_manager::LoadStatus::snapshot(&app.load_status, &cfg).await,
+	))
 }
 
 async fn write_config(

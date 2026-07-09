@@ -1,18 +1,11 @@
 import type { GatewayConfig } from "../types";
 import { requestJson } from "./base";
 
-export interface ConfigLoadAttempt {
-  at: string;
-  error: string | null;
-}
-
 export interface ConfigLoadStatus {
-  state: "synced" | "drifted" | "failed";
-  appliedGeneration: number | null;
-  appliedAt: string | null;
-  appliedHash: string | null;
-  lastAttempt: ConfigLoadAttempt | null;
-  storedMatchesApplied: boolean;
+  runningHash: string | null;
+  diskHash: string | null;
+  error: string | null;
+  lastUpdatedAt: string | null;
 }
 
 export function getConfig() {

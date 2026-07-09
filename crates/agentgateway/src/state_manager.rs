@@ -24,7 +24,7 @@ pub struct StateManager {
 	resource_manager: crate::resource_manager::ResourceManager,
 
 	#[serde(skip_serializing)]
-	load_status: crate::load_status::Watcher,
+	load_status: SharedLoadStatus,
 }
 
 pub const ADDRESS_TYPE: Strng = strng::literal!("type.googleapis.com/istio.workload.Address");
@@ -70,7 +70,7 @@ impl StateManager {
 		} else {
 			None
 		};
-		let (load_publisher, load_status) = crate::load_status::channel(xds.local_config.is_some());
+		let load_status = SharedLoadStatus::default();
 		if let Some(cfg) = &xds.local_config {
 			let local_client = LocalClient {
 				config: config.clone(),
@@ -85,7 +85,7 @@ impl StateManager {
 					port: None,
 				},
 				metrics: config_metrics,
-				status: load_publisher,
+				status: load_status.clone(),
 			};
 			Box::pin(local_client.run()).await?;
 		}
@@ -105,7 +105,7 @@ impl StateManager {
 		self.resource_manager.clone()
 	}
 
-	pub fn load_status(&self) -> crate::load_status::Watcher {
+	pub fn load_status(&self) -> SharedLoadStatus {
 		self.load_status.clone()
 	}
 
@@ -115,6 +115,39 @@ impl StateManager {
 			None => Ok(()),
 		}
 	}
+}
+
+/// Shared handle to the load status, written by [`LocalClient`] and read by the
+/// admin and UI endpoints.
+pub type SharedLoadStatus = Arc<std::sync::RwLock<LoadStatus>>;
+
+/// LoadStatus reports the outcome of the most recent local config load,
+/// alongside the `config_synchronized` metric.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadStatus {
+	running_hash: Option<String>,
+	disk_hash: Option<String>,
+	error: Option<String>,
+	last_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl LoadStatus {
+	/// Returns a snapshot of the status with `disk_hash` computed from the
+	/// current config source content.
+	pub async fn snapshot(status: &SharedLoadStatus, cfg: &ConfigSource) -> LoadStatus {
+		let mut snapshot = status.read().expect("mutex acquired").clone();
+		snapshot.disk_hash = cfg.read_to_string().await.ok().map(|c| content_hash(&c));
+		snapshot
+	}
+}
+
+fn content_hash(content: &str) -> String {
+	use sha2::Digest as _;
+	format!(
+		"sha256:{}",
+		hex::encode(sha2::Sha256::digest(content.as_bytes()))
+	)
 }
 
 /// LocalClient loads configuration from a local file or static content and
@@ -129,7 +162,7 @@ pub struct LocalClient {
 	pub resource_manager: crate::resource_manager::ResourceManager,
 	pub gateway: ListenerTarget,
 	pub metrics: Arc<agent_xds::Metrics>,
-	status: crate::load_status::Publisher,
+	status: SharedLoadStatus,
 }
 
 impl LocalClient {
@@ -231,7 +264,12 @@ impl LocalClient {
 				.discovery
 				.sync_local(config.services, config.workloads, prev.discovery)?;
 
-		self.status.success(config_content);
+		{
+			let mut status = self.status.write().expect("mutex acquired");
+			status.running_hash = Some(content_hash(&config_content));
+			status.error = None;
+			status.last_updated_at = Some(chrono::Utc::now());
+		}
 
 		Ok(PreviousState {
 			binds: next_binds,
@@ -248,8 +286,12 @@ impl LocalClient {
 				nxt
 			},
 			Err(e) => {
-				// publish before the gauge flips so observers of the metric see the error
-				self.status.failure(format!("{e:#}"));
+				// record before the gauge flips so observers of the metric see the error
+				{
+					let mut status = self.status.write().expect("mutex acquired");
+					status.error = Some(format!("{e:#}"));
+					status.last_updated_at = Some(chrono::Utc::now());
+				}
 				self.metrics.config_synchronized.set(0);
 				error!("Failed to reload config: {}", e);
 				prev
@@ -515,7 +557,7 @@ frontendPolicies:
 		config: Arc<crate::Config>,
 		stores: Stores,
 		resource_manager: crate::resource_manager::ResourceManager,
-		load_status: crate::load_status::Watcher,
+		load_status: SharedLoadStatus,
 	) -> (std::net::SocketAddr, agent_core::drain::DrainTrigger) {
 		let shutdown = agent_core::signal::Shutdown::new();
 		let (drain_tx, drain_rx) = agent_core::drain::new();
@@ -569,7 +611,7 @@ frontendPolicies:
 		let client = test_client();
 		let resource_manager =
 			crate::resource_manager::ResourceManager::new(client.clone()).expect("resource manager");
-		let (publisher, watcher) = crate::load_status::channel(true);
+		let load_status = SharedLoadStatus::default();
 		let local_client = LocalClient {
 			config: config.clone(),
 			cfg: ConfigSource::File(path.to_path_buf()),
@@ -578,11 +620,16 @@ frontendPolicies:
 			resource_manager: resource_manager.clone(),
 			gateway: config.gateway(),
 			metrics: metrics.clone(),
-			status: publisher,
+			status: load_status.clone(),
 		};
 		local_client.run().await.expect("initial config load");
-		let (addr, _drain_tx) =
-			spawn_admin(config.clone(), stores.clone(), resource_manager, watcher).await;
+		let (addr, _drain_tx) = spawn_admin(
+			config.clone(),
+			stores.clone(),
+			resource_manager,
+			load_status,
+		)
+		.await;
 		LiveGateway {
 			config,
 			stores,
@@ -602,8 +649,8 @@ frontendPolicies:
 	}
 
 	// GET /api/config returns the stored config file, byte-compatible with older
-	// releases, even when that file was never applied. the applied config and load
-	// state are exposed additively on /api/config/live and /api/config/status.
+	// releases, even when that file never loaded. the load state is exposed
+	// additively on /api/config/status.
 	#[cfg(feature = "ui")]
 	#[tokio::test]
 	async fn api_config_returns_unapplied_file_config_after_failed_reload() {
@@ -660,30 +707,26 @@ binds:
 			"GET /api/config returned the stored file, not the applied config: {body}"
 		);
 
-		// /api/config/live reports the applied config plus the failure
-		let (code, live) = get_json(format!("http://{}/api/config/live", gw.addr)).await;
-		assert_eq!(code, reqwest::StatusCode::OK);
-		assert_eq!(
-			live["config"]["frontendPolicies"]["accessLog"]["remove"][0], "alpha",
-			"live config should be the applied config: {live}"
-		);
-		assert_eq!(live["status"]["state"], "failed", "{live}");
-		assert_eq!(live["status"]["storedMatchesApplied"], false, "{live}");
-		assert_eq!(live["status"]["appliedGeneration"], 1, "{live}");
-		assert!(
-			live["status"]["lastAttempt"]["error"].is_string(),
-			"load error should be reported: {live}"
-		);
-
-		// /api/config/status reports the same status standalone
+		// /api/config/status reports the failure and the hash mismatch
 		let (code, status) = get_json(format!("http://{}/api/config/status", gw.addr)).await;
 		assert_eq!(code, reqwest::StatusCode::OK);
-		assert_eq!(status["state"], "failed", "{status}");
+		assert!(
+			status["error"].is_string(),
+			"load error should be reported: {status}"
+		);
+		assert!(
+			status["runningHash"].is_string() && status["diskHash"].is_string(),
+			"{status}"
+		);
+		assert_ne!(
+			status["runningHash"], status["diskHash"],
+			"running and disk hash should diverge after a failed reload: {status}"
+		);
 
 		// /config_dump includes the load status additively
 		let (code, dump) = get_json(format!("http://{}/config_dump", gw.addr)).await;
 		assert_eq!(code, reqwest::StatusCode::OK);
-		assert_eq!(dump["localConfigStatus"]["state"], "failed", "{dump}");
+		assert!(dump["localConfigStatus"]["error"].is_string(), "{dump}");
 	}
 
 	#[cfg(feature = "ui")]
@@ -704,7 +747,7 @@ binds:
 		wait_for_failed_reload(&gw.metrics).await;
 
 		// the gateway still runs the old config; /api/config can only 500 (kept
-		// for compatibility), while /api/config/live still serves the applied config
+		// for compatibility), while /api/config/status still reports the load state
 		let frontend = gw
 			.stores
 			.binds
@@ -727,18 +770,18 @@ binds:
 			"GET /api/config cannot report anything about the running config once the file is corrupt"
 		);
 
-		let (code, live) = get_json(format!("http://{}/api/config/live", gw.addr)).await;
+		let (code, status) = get_json(format!("http://{}/api/config/status", gw.addr)).await;
 		assert_eq!(code, reqwest::StatusCode::OK);
-		assert_eq!(
-			live["config"]["frontendPolicies"]["accessLog"]["remove"][0], "alpha",
-			"live config must survive a corrupt stored file: {live}"
+		assert!(
+			status["error"].is_string(),
+			"load status must survive a corrupt stored file: {status}"
 		);
-		assert_eq!(live["status"]["state"], "failed", "{live}");
+		assert!(status["runningHash"].is_string(), "{status}");
 	}
 
 	#[cfg(feature = "ui")]
 	#[tokio::test]
-	async fn api_config_status_reports_synced_and_tracks_generations() {
+	async fn api_config_status_reports_matching_hashes_when_synced() {
 		let dir = tempfile::tempdir().unwrap();
 		let path = dir.path().join("config.yaml");
 		fs_err::tokio::write(&path, local_config("alpha"))
@@ -750,21 +793,19 @@ binds:
 
 		let (code, status) = get_json(format!("http://{}/api/config/status", gw.addr)).await;
 		assert_eq!(code, reqwest::StatusCode::OK);
-		assert_eq!(status["state"], "synced", "{status}");
-		assert_eq!(status["storedMatchesApplied"], true, "{status}");
-		assert_eq!(status["appliedGeneration"], 1, "{status}");
-		assert!(status["appliedAt"].is_string(), "{status}");
+		assert!(status["error"].is_null(), "{status}");
+		assert!(status["lastUpdatedAt"].is_string(), "{status}");
 		assert!(
-			status["appliedHash"]
+			status["runningHash"]
 				.as_str()
 				.is_some_and(|h| h.starts_with("sha256:")),
 			"{status}"
 		);
-		assert!(status["lastAttempt"]["error"].is_null(), "{status}");
+		assert_eq!(status["runningHash"], status["diskHash"], "{status}");
+		let initial_hash = status["runningHash"].clone();
 
-		// a successful reload bumps the generation and stays synced. the store is
-		// synced before the status is recorded, and the watcher may observe a
-		// single write as more than one event, so poll for the advanced generation.
+		// a successful reload moves the running hash to the new content. the store
+		// is synced before the status is written, so poll for the hash to move.
 		fs_err::tokio::write(&path, local_config("gamma"))
 			.await
 			.unwrap();
@@ -773,22 +814,16 @@ binds:
 		let status = tokio::time::timeout(Duration::from_secs(5), async {
 			loop {
 				let (_, status) = get_json(format!("http://{}/api/config/status", gw.addr)).await;
-				if status["appliedGeneration"].as_u64().is_some_and(|g| g >= 2) {
+				if status["runningHash"].is_string() && status["runningHash"] != initial_hash {
 					return status;
 				}
 				tokio::time::sleep(Duration::from_millis(10)).await;
 			}
 		})
 		.await
-		.expect("timed out waiting for applied generation to advance");
-		assert_eq!(status["state"], "synced", "{status}");
-
-		let (code, live) = get_json(format!("http://{}/api/config/live", gw.addr)).await;
-		assert_eq!(code, reqwest::StatusCode::OK);
-		assert_eq!(
-			live["config"]["frontendPolicies"]["accessLog"]["remove"][0], "gamma",
-			"{live}"
-		);
+		.expect("timed out waiting for running hash to advance");
+		assert!(status["error"].is_null(), "{status}");
+		assert_eq!(status["runningHash"], status["diskHash"], "{status}");
 	}
 
 	#[tokio::test]
@@ -815,7 +850,7 @@ binds:
 			resource_manager,
 			gateway: config.gateway(),
 			metrics,
-			status: crate::load_status::channel(true).0,
+			status: SharedLoadStatus::default(),
 		};
 
 		local_client.run().await.unwrap();
