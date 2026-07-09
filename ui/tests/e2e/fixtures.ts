@@ -220,6 +220,17 @@ export async function mockGateway(
     await route.fallback();
   });
 
+  await page.route("**/api/config/status", async (route) => {
+    await json(route, {
+      state: "synced",
+      appliedGeneration: 1,
+      appliedAt: new Date().toISOString(),
+      appliedHash: "sha256:test",
+      lastAttempt: { at: new Date().toISOString(), error: null },
+      storedMatchesApplied: true,
+    });
+  });
+
   await page.route("**/api/logs/search", async (route) => {
     await json(route, {
       logs: [

@@ -3,7 +3,12 @@ import { Clipboard, Download, Save, RotateCcw } from "lucide-react";
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { validateGatewayConfig } from "../configValidation";
 import { PageHeader, Panel, StatusBanner } from "../components/Primitives";
-import { useConfigDumpMode, useGatewayConfig, useUpdateConfig } from "../hooks";
+import {
+  useConfigDumpMode,
+  useConfigLoadStatus,
+  useGatewayConfig,
+  useUpdateConfig,
+} from "../hooks";
 import { parseYamlText, toYamlText } from "../policies/policyUtils";
 import type { GatewayConfig } from "../types";
 
@@ -34,6 +39,7 @@ export function RawConfigPage() {
 
 function RawConfigEditorPage() {
   const config = useGatewayConfig();
+  const loadStatus = useConfigLoadStatus();
   const update = useUpdateConfig();
   const initialText = useMemo(
     () => (config.data ? toYamlText(config.data) : ""),
@@ -131,6 +137,21 @@ function RawConfigEditorPage() {
         <StatusBanner state="bad" title="Configuration API unavailable">
           {config.error.message}
         </StatusBanner>
+      ) : null}
+      {loadStatus.data?.state === "failed" ? (
+        <StatusBanner
+          state="bad"
+          title="The gateway failed to load this configuration"
+        >
+          {loadStatus.data.lastAttempt?.error ??
+            "The gateway is still running the last successfully applied configuration."}
+        </StatusBanner>
+      ) : null}
+      {loadStatus.data?.state === "drifted" ? (
+        <StatusBanner
+          state="warn"
+          title="Stored configuration differs from the running configuration"
+        />
       ) : null}
       {error ? (
         <StatusBanner state="bad" title="Save failed">
