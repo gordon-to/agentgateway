@@ -493,6 +493,187 @@ frontendPolicies:
 		assert!(stores.discovery.read().self_workload.get().is_some());
 	}
 
+	#[cfg(feature = "ui")]
+	async fn spawn_admin(
+		config: Arc<crate::Config>,
+		stores: Stores,
+		resource_manager: crate::resource_manager::ResourceManager,
+	) -> (std::net::SocketAddr, agent_core::drain::DrainTrigger) {
+		let shutdown = agent_core::signal::Shutdown::new();
+		let (drain_tx, drain_rx) = agent_core::drain::new();
+		let svc = crate::management::admin::Service::new(
+			config,
+			crate::llm::cost::ModelCatalog::empty(),
+			stores,
+			resource_manager,
+			shutdown.trigger(),
+			drain_rx,
+			tokio::runtime::Handle::current(),
+		)
+		.await
+		.expect("admin server should bind");
+		let addr = svc.address().expect("admin server should have an address");
+		svc.spawn();
+		(addr, drain_tx)
+	}
+
+	#[cfg(feature = "ui")]
+	async fn wait_for_failed_reload(metrics: &agent_xds::Metrics) {
+		tokio::time::timeout(Duration::from_secs(5), async {
+			while metrics.config_synchronized.get() != 0 {
+				tokio::time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await
+		.expect("timed out waiting for reload failure");
+	}
+
+	#[cfg(feature = "ui")]
+	struct LiveGateway {
+		config: Arc<crate::Config>,
+		stores: Stores,
+		metrics: Arc<agent_xds::Metrics>,
+		addr: std::net::SocketAddr,
+		_drain_tx: agent_core::drain::DrainTrigger,
+	}
+
+	#[cfg(feature = "ui")]
+	async fn start_gateway_with_config_file(path: &Path) -> LiveGateway {
+		let mut config =
+			crate::config::parse_config("config:\n  adminAddr: localhost:0\n".to_string(), None)
+				.expect("parse config");
+		config.xds.local_config = Some(ConfigSource::File(path.to_path_buf()));
+		let config = Arc::new(config);
+		let stores = test_stores();
+		let mut registry = prometheus_client::registry::Registry::default();
+		let metrics = Arc::new(agent_xds::Metrics::new(&mut registry));
+		let client = test_client();
+		let resource_manager =
+			crate::resource_manager::ResourceManager::new(client.clone()).expect("resource manager");
+		let local_client = LocalClient {
+			config: config.clone(),
+			cfg: ConfigSource::File(path.to_path_buf()),
+			stores: stores.clone(),
+			client,
+			resource_manager: resource_manager.clone(),
+			gateway: config.gateway(),
+			metrics: metrics.clone(),
+		};
+		local_client.run().await.expect("initial config load");
+		let (addr, _drain_tx) = spawn_admin(config.clone(), stores.clone(), resource_manager).await;
+		LiveGateway {
+			config,
+			stores,
+			metrics,
+			addr,
+			_drain_tx,
+		}
+	}
+
+	// these tests pin the current behavior of GET /api/config: it reads the config
+	// file from disk rather than the config the gateway actually loaded. after a
+	// failed reload the endpoint reports a config that was never applied, with a
+	// 200 status and no indication that loading failed.
+	#[cfg(feature = "ui")]
+	#[tokio::test]
+	async fn api_config_returns_unapplied_file_config_after_failed_reload() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("config.yaml");
+		fs_err::tokio::write(&path, local_config("alpha"))
+			.await
+			.unwrap();
+
+		let gw = start_gateway_with_config_file(&path).await;
+		wait_for_access_log_remove(&gw.config, &gw.stores, "alpha").await;
+
+		// while disk and runtime agree, the endpoint reports the applied config
+		let resp = reqwest::get(format!("http://{}/api/config", gw.addr))
+			.await
+			.unwrap();
+		assert_eq!(resp.status(), reqwest::StatusCode::OK);
+		assert!(resp.text().await.unwrap().contains("alpha"));
+
+		// valid yaml that fails validation: a bind without a port must set mode: internal
+		let broken = r#"
+frontendPolicies:
+  accessLog:
+    remove:
+    - beta
+binds:
+- listeners: []
+"#;
+		fs_err::tokio::write(&path, broken).await.unwrap();
+		wait_for_failed_reload(&gw.metrics).await;
+
+		// the runtime kept the previously applied config
+		let frontend = gw
+			.stores
+			.binds
+			.read()
+			.frontend_policies(gw.config.gateway_ref());
+		assert!(
+			frontend
+				.access_log
+				.as_ref()
+				.is_some_and(|access_log| access_log.remove.contains("alpha")),
+			"runtime should still run the last successfully applied config"
+		);
+
+		// but /api/config reports the never-applied on-disk config as if it were live,
+		// with no error or load-status indication
+		let resp = reqwest::get(format!("http://{}/api/config", gw.addr))
+			.await
+			.unwrap();
+		assert_eq!(resp.status(), reqwest::StatusCode::OK);
+		let body = resp.text().await.unwrap();
+		assert!(
+			body.contains("beta") && !body.contains("alpha"),
+			"GET /api/config returned the stored file, not the applied config: {body}"
+		);
+	}
+
+	#[cfg(feature = "ui")]
+	#[tokio::test]
+	async fn api_config_errors_when_stored_config_is_unparseable() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("config.yaml");
+		fs_err::tokio::write(&path, local_config("alpha"))
+			.await
+			.unwrap();
+
+		let gw = start_gateway_with_config_file(&path).await;
+		wait_for_access_log_remove(&gw.config, &gw.stores, "alpha").await;
+
+		fs_err::tokio::write(&path, "{ this is not yaml [")
+			.await
+			.unwrap();
+		wait_for_failed_reload(&gw.metrics).await;
+
+		// the gateway still runs the old config, but the endpoint can only 500:
+		// it has no access to the applied config or the load failure
+		let frontend = gw
+			.stores
+			.binds
+			.read()
+			.frontend_policies(gw.config.gateway_ref());
+		assert!(
+			frontend
+				.access_log
+				.as_ref()
+				.is_some_and(|access_log| access_log.remove.contains("alpha")),
+			"runtime should still run the last successfully applied config"
+		);
+
+		let resp = reqwest::get(format!("http://{}/api/config", gw.addr))
+			.await
+			.unwrap();
+		assert_eq!(
+			resp.status(),
+			reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+			"GET /api/config cannot report anything about the running config once the file is corrupt"
+		);
+	}
+
 	#[tokio::test]
 	async fn file_config_reloads_after_repeated_rename_replacement() {
 		let dir = tempfile::tempdir().unwrap();
