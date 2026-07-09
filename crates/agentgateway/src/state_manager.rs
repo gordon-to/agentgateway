@@ -117,12 +117,11 @@ impl StateManager {
 	}
 }
 
-/// Shared handle to the load status, written by [`LocalClient`] and read by the
-/// admin and UI endpoints.
 pub type SharedLoadStatus = Arc<std::sync::RwLock<LoadStatus>>;
 
-/// LoadStatus reports the outcome of the most recent local config load,
-/// alongside the `config_synchronized` metric.
+/// LoadStatus reports the outcome of the most recent local config load. It is
+/// written by [`LocalClient`] alongside the `config_synchronized` metric and
+/// read by the admin and UI endpoints.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoadStatus {
@@ -286,7 +285,7 @@ impl LocalClient {
 				nxt
 			},
 			Err(e) => {
-				// record before the gauge flips so observers of the metric see the error
+				// Record the error before the gauge flips so observers of the metric see it
 				{
 					let mut status = self.status.write().expect("mutex acquired");
 					status.error = Some(format!("{e:#}"));
@@ -648,9 +647,8 @@ frontendPolicies:
 		(status, value)
 	}
 
-	// GET /api/config returns the stored config file, byte-compatible with older
-	// releases, even when that file never loaded. the load state is exposed
-	// additively on /api/config/status.
+	// A failed reload leaves /api/config serving the never-applied stored file;
+	// /api/config/status reports the failure
 	#[cfg(feature = "ui")]
 	#[tokio::test]
 	async fn api_config_returns_unapplied_file_config_after_failed_reload() {
@@ -663,14 +661,14 @@ frontendPolicies:
 		let gw = start_gateway_with_config_file(&path).await;
 		wait_for_access_log_remove(&gw.config, &gw.stores, "alpha").await;
 
-		// while disk and runtime agree, the endpoint reports the applied config
+		// While disk and runtime agree, the endpoint reports the applied config
 		let resp = reqwest::get(format!("http://{}/api/config", gw.addr))
 			.await
 			.unwrap();
 		assert_eq!(resp.status(), reqwest::StatusCode::OK);
 		assert!(resp.text().await.unwrap().contains("alpha"));
 
-		// valid yaml that fails validation: a bind without a port must set mode: internal
+		// Valid yaml that fails validation: a bind without a port must set mode: internal
 		let broken = r#"
 frontendPolicies:
   accessLog:
@@ -682,7 +680,7 @@ binds:
 		fs_err::tokio::write(&path, broken).await.unwrap();
 		wait_for_failed_reload(&gw.metrics).await;
 
-		// the runtime kept the previously applied config
+		// The runtime kept the previously applied config
 		let frontend = gw
 			.stores
 			.binds
@@ -746,8 +744,8 @@ binds:
 			.unwrap();
 		wait_for_failed_reload(&gw.metrics).await;
 
-		// the gateway still runs the old config; /api/config can only 500 (kept
-		// for compatibility), while /api/config/status still reports the load state
+		// The gateway still runs the old config: /api/config can only 500, while
+		// /api/config/status still reports the load state
 		let frontend = gw
 			.stores
 			.binds
@@ -804,7 +802,7 @@ binds:
 		assert_eq!(status["runningHash"], status["diskHash"], "{status}");
 		let initial_hash = status["runningHash"].clone();
 
-		// a successful reload moves the running hash to the new content. the store
+		// A successful reload moves the running hash to the new content. The store
 		// is synced before the status is written, so poll for the hash to move.
 		fs_err::tokio::write(&path, local_config("gamma"))
 			.await
