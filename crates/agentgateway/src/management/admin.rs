@@ -70,7 +70,7 @@ struct AdminState {
 	shutdown_trigger: signal::ShutdownTrigger,
 	#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 	dataplane_handle: Handle,
-	local_config_status: Option<crate::state_manager::LoadStatus>,
+	load_status: crate::load_status::Watcher,
 }
 
 pub struct Service {
@@ -91,7 +91,7 @@ pub struct ConfigDump {
 	version: BuildInfo,
 	config: Arc<Config>,
 	#[serde(skip_serializing_if = "Option::is_none")]
-	local_config_status: Option<crate::state_manager::Status>,
+	local_config_status: Option<crate::load_status::Status>,
 }
 
 #[derive(serde::Serialize, Debug, Clone, Default)]
@@ -120,7 +120,7 @@ impl Service {
 		model_catalog: Arc<crate::llm::cost::ModelCatalog>,
 		stores: crate::store::Stores,
 		resource_manager: crate::resource_manager::ResourceManager,
-		local_config_status: Option<crate::state_manager::LoadStatus>,
+		load_status: crate::load_status::Watcher,
 		shutdown_trigger: signal::ShutdownTrigger,
 		drain_rx: DrainWatcher,
 		dataplane_handle: Handle,
@@ -132,7 +132,7 @@ impl Service {
 			resource_manager,
 			shutdown_trigger,
 			dataplane_handle,
-			local_config_status,
+			load_status,
 		});
 		let service = AdminService {
 			router: admin_router(state.clone()),
@@ -193,7 +193,7 @@ fn admin_router(state: Arc<AdminState>) -> Router {
 		state.config.clone(),
 		state.model_catalog.clone(),
 		state.resource_manager.clone(),
-		state.local_config_status.clone(),
+		state.load_status.clone(),
 	));
 	#[cfg(not(feature = "ui"))]
 	let router = router.route("/", get(handle_dashboard));
@@ -457,9 +457,9 @@ async fn handle_tokio_tasks(
 async fn handle_config_dump(
 	AxumState(state): AxumState<Arc<AdminState>>,
 ) -> Result<Response, AdminError> {
-	let local_config_status = match (&state.local_config_status, &state.config.xds.local_config) {
-		(Some(status), Some(cfg)) => Some(status.status(cfg).await),
-		_ => None,
+	let local_config_status = match &state.config.xds.local_config {
+		Some(cfg) => state.load_status.status(cfg).await,
+		None => None,
 	};
 	let dump = ConfigDump {
 		stores: state.stores.clone(),

@@ -30,7 +30,7 @@ struct App {
 	state: Arc<Config>,
 	resource_manager: crate::resource_manager::ResourceManager,
 	model_catalog: Arc<ModelCatalog>,
-	local_config_status: Option<crate::state_manager::LoadStatus>,
+	load_status: crate::load_status::Watcher,
 }
 
 impl App {
@@ -39,13 +39,6 @@ impl App {
 			.state
 			.xds
 			.local_config
-			.clone()
-			.ok_or(ErrorResponse::String("local config not setup".to_string()))
-	}
-
-	fn load_status(&self) -> Result<crate::state_manager::LoadStatus, ErrorResponse> {
-		self
-			.local_config_status
 			.clone()
 			.ok_or(ErrorResponse::String("local config not setup".to_string()))
 	}
@@ -59,7 +52,7 @@ pub fn router(
 	cfg: Arc<Config>,
 	model_catalog: Arc<ModelCatalog>,
 	resource_manager: crate::resource_manager::ResourceManager,
-	local_config_status: Option<crate::state_manager::LoadStatus>,
+	load_status: crate::load_status::Watcher,
 ) -> Router {
 	let ui_service = tower::service_fn(move |req| serve_ui_asset(req, &ASSETS_DIR));
 	Router::new()
@@ -83,7 +76,7 @@ pub fn router(
 			state: cfg.clone(),
 			resource_manager,
 			model_catalog,
-			local_config_status,
+			load_status,
 		})
 }
 
@@ -198,7 +191,11 @@ async fn get_config(State(app): State<App>) -> Result<Json<Value>, ErrorResponse
 
 async fn get_config_live(State(app): State<App>) -> Result<Json<Value>, ErrorResponse> {
 	let cfg = app.cfg()?;
-	let (applied, status) = app.load_status()?.live(&cfg).await;
+	let (applied, status) = app
+		.load_status
+		.live(&cfg)
+		.await
+		.ok_or(ErrorResponse::String("local config not setup".to_string()))?;
 	let config = match applied {
 		Some(raw) => yamlviajson::from_str::<Value>(&raw).map_err(ErrorResponse::Anyhow)?,
 		None => Value::Null,
@@ -211,9 +208,14 @@ async fn get_config_live(State(app): State<App>) -> Result<Json<Value>, ErrorRes
 
 async fn get_config_status(
 	State(app): State<App>,
-) -> Result<Json<crate::state_manager::Status>, ErrorResponse> {
+) -> Result<Json<crate::load_status::Status>, ErrorResponse> {
 	let cfg = app.cfg()?;
-	Ok(Json(app.load_status()?.status(&cfg).await))
+	let status = app
+		.load_status
+		.status(&cfg)
+		.await
+		.ok_or(ErrorResponse::String("local config not setup".to_string()))?;
+	Ok(Json(status))
 }
 
 async fn write_config(

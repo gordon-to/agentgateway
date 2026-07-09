@@ -24,7 +24,7 @@ pub struct StateManager {
 	resource_manager: crate::resource_manager::ResourceManager,
 
 	#[serde(skip_serializing)]
-	local_config_status: Option<LoadStatus>,
+	load_status: crate::load_status::Watcher,
 }
 
 pub const ADDRESS_TYPE: Strng = strng::literal!("type.googleapis.com/istio.workload.Address");
@@ -70,10 +70,8 @@ impl StateManager {
 		} else {
 			None
 		};
-		let mut local_config_status = None;
+		let (load_publisher, load_status) = crate::load_status::channel(xds.local_config.is_some());
 		if let Some(cfg) = &xds.local_config {
-			let status = LoadStatus::default();
-			local_config_status = Some(status.clone());
 			let local_client = LocalClient {
 				config: config.clone(),
 				stores: stores.clone(),
@@ -87,7 +85,7 @@ impl StateManager {
 					port: None,
 				},
 				metrics: config_metrics,
-				status,
+				status: load_publisher,
 			};
 			Box::pin(local_client.run()).await?;
 		}
@@ -95,7 +93,7 @@ impl StateManager {
 			stores,
 			xds_client,
 			resource_manager,
-			local_config_status,
+			load_status,
 		})
 	}
 
@@ -107,8 +105,8 @@ impl StateManager {
 		self.resource_manager.clone()
 	}
 
-	pub fn local_config_status(&self) -> Option<LoadStatus> {
-		self.local_config_status.clone()
+	pub fn load_status(&self) -> crate::load_status::Watcher {
+		self.load_status.clone()
 	}
 
 	pub async fn run(self) -> anyhow::Result<()> {
@@ -119,129 +117,9 @@ impl StateManager {
 	}
 }
 
-/// LoadStatus tracks the outcome of local config load attempts: the raw config
-/// that was last successfully applied and the result of the most recent attempt.
-/// It is shared between the loader and the admin/UI endpoints that report it.
-#[derive(Debug, Clone, Default)]
-pub struct LoadStatus {
-	inner: Arc<std::sync::RwLock<LoadStatusInner>>,
-}
-
-#[derive(Debug, Default)]
-struct LoadStatusInner {
-	applied: Option<Applied>,
-	last_attempt: Option<Attempt>,
-}
-
-#[derive(Debug, Clone)]
-struct Applied {
-	raw: String,
-	generation: u64,
-	at: chrono::DateTime<chrono::Utc>,
-	hash: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Attempt {
-	at: chrono::DateTime<chrono::Utc>,
-	error: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum LoadState {
-	Synced,
-	Drifted,
-	Failed,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Status {
-	state: LoadState,
-	applied_generation: Option<u64>,
-	applied_at: Option<chrono::DateTime<chrono::Utc>>,
-	applied_hash: Option<String>,
-	last_attempt: Option<Attempt>,
-	stored_matches_applied: bool,
-}
-
-impl LoadStatus {
-	fn record_success(&self, raw: String) {
-		use sha2::Digest as _;
-		let at = chrono::Utc::now();
-		let hash = format!(
-			"sha256:{}",
-			hex::encode(sha2::Sha256::digest(raw.as_bytes()))
-		);
-		let mut inner = self.inner.write().expect("mutex acquired");
-		let generation = inner.applied.as_ref().map_or(0, |a| a.generation) + 1;
-		inner.applied = Some(Applied {
-			raw,
-			generation,
-			at,
-			hash,
-		});
-		inner.last_attempt = Some(Attempt { at, error: None });
-	}
-
-	fn record_failure(&self, error: String) {
-		let mut inner = self.inner.write().expect("mutex acquired");
-		inner.last_attempt = Some(Attempt {
-			at: chrono::Utc::now(),
-			error: Some(error),
-		});
-	}
-
-	/// Returns the last successfully applied raw config and the load status as
-	/// one consistent snapshot.
-	pub async fn live(&self, cfg: &ConfigSource) -> (Option<String>, Status) {
-		let (applied, last_attempt) = {
-			let inner = self.inner.read().expect("mutex acquired");
-			(inner.applied.clone(), inner.last_attempt.clone())
-		};
-		let stored_matches_applied = match &applied {
-			Some(applied) => match cfg.read_to_string().await {
-				Ok(stored) => config_equivalent(&applied.raw, &stored),
-				Err(_) => false,
-			},
-			None => false,
-		};
-		let failed = last_attempt.as_ref().is_some_and(|a| a.error.is_some());
-		let state = if failed {
-			LoadState::Failed
-		} else if stored_matches_applied {
-			LoadState::Synced
-		} else {
-			LoadState::Drifted
-		};
-		let status = Status {
-			state,
-			applied_generation: applied.as_ref().map(|a| a.generation),
-			applied_at: applied.as_ref().map(|a| a.at),
-			applied_hash: applied.as_ref().map(|a| a.hash.clone()),
-			last_attempt,
-			stored_matches_applied,
-		};
-		(applied.map(|a| a.raw), status)
-	}
-
-	pub async fn status(&self, cfg: &ConfigSource) -> Status {
-		self.live(cfg).await.1
-	}
-}
-
-// compares configs by parsed value so formatting and comments don't count as drift
-fn config_equivalent(a: &str, b: &str) -> bool {
-	let parse = |s: &str| crate::yamlviajson::from_str::<serde_json::Value>(s).ok();
-	match (parse(a), parse(b)) {
-		(Some(a), Some(b)) => a == b,
-		_ => false,
-	}
-}
-
-/// LocalClient serves as a local file reader alternative for XDS. This is intended for testing.
+/// LocalClient loads configuration from a local file or static content and
+/// watches it for changes. Standalone (non-XDS) deployments configure the
+/// gateway through this client.
 #[derive(Debug, Clone)]
 pub struct LocalClient {
 	config: Arc<crate::Config>,
@@ -251,7 +129,7 @@ pub struct LocalClient {
 	pub resource_manager: crate::resource_manager::ResourceManager,
 	pub gateway: ListenerTarget,
 	pub metrics: Arc<agent_xds::Metrics>,
-	status: LoadStatus,
+	status: crate::load_status::Publisher,
 }
 
 impl LocalClient {
@@ -353,7 +231,7 @@ impl LocalClient {
 				.discovery
 				.sync_local(config.services, config.workloads, prev.discovery)?;
 
-		self.status.record_success(config_content);
+		self.status.success(config_content);
 
 		Ok(PreviousState {
 			binds: next_binds,
@@ -370,8 +248,8 @@ impl LocalClient {
 				nxt
 			},
 			Err(e) => {
-				// record before the gauge flips so observers of the metric see the error
-				self.status.record_failure(format!("{e:#}"));
+				// publish before the gauge flips so observers of the metric see the error
+				self.status.failure(format!("{e:#}"));
 				self.metrics.config_synchronized.set(0);
 				error!("Failed to reload config: {}", e);
 				prev
@@ -637,7 +515,7 @@ frontendPolicies:
 		config: Arc<crate::Config>,
 		stores: Stores,
 		resource_manager: crate::resource_manager::ResourceManager,
-		local_config_status: Option<LoadStatus>,
+		load_status: crate::load_status::Watcher,
 	) -> (std::net::SocketAddr, agent_core::drain::DrainTrigger) {
 		let shutdown = agent_core::signal::Shutdown::new();
 		let (drain_tx, drain_rx) = agent_core::drain::new();
@@ -646,7 +524,7 @@ frontendPolicies:
 			crate::llm::cost::ModelCatalog::empty(),
 			stores,
 			resource_manager,
-			local_config_status,
+			load_status,
 			shutdown.trigger(),
 			drain_rx,
 			tokio::runtime::Handle::current(),
@@ -691,7 +569,7 @@ frontendPolicies:
 		let client = test_client();
 		let resource_manager =
 			crate::resource_manager::ResourceManager::new(client.clone()).expect("resource manager");
-		let status = LoadStatus::default();
+		let (publisher, watcher) = crate::load_status::channel(true);
 		let local_client = LocalClient {
 			config: config.clone(),
 			cfg: ConfigSource::File(path.to_path_buf()),
@@ -700,16 +578,11 @@ frontendPolicies:
 			resource_manager: resource_manager.clone(),
 			gateway: config.gateway(),
 			metrics: metrics.clone(),
-			status: status.clone(),
+			status: publisher,
 		};
 		local_client.run().await.expect("initial config load");
-		let (addr, _drain_tx) = spawn_admin(
-			config.clone(),
-			stores.clone(),
-			resource_manager,
-			Some(status),
-		)
-		.await;
+		let (addr, _drain_tx) =
+			spawn_admin(config.clone(), stores.clone(), resource_manager, watcher).await;
 		LiveGateway {
 			config,
 			stores,
@@ -942,7 +815,7 @@ binds:
 			resource_manager,
 			gateway: config.gateway(),
 			metrics,
-			status: LoadStatus::default(),
+			status: crate::load_status::channel(true).0,
 		};
 
 		local_client.run().await.unwrap();
