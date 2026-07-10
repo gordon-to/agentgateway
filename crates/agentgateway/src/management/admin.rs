@@ -71,7 +71,7 @@ struct AdminState {
 	#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 	dataplane_handle: Handle,
 	#[cfg_attr(not(feature = "ui"), allow(dead_code))]
-	load_status: crate::state_manager::SharedLoadStatus,
+	local_client: Option<crate::state_manager::LocalClient>,
 }
 
 pub struct Service {
@@ -119,7 +119,7 @@ impl Service {
 		model_catalog: Arc<crate::llm::cost::ModelCatalog>,
 		stores: crate::store::Stores,
 		resource_manager: crate::resource_manager::ResourceManager,
-		load_status: crate::state_manager::SharedLoadStatus,
+		local_client: Option<crate::state_manager::LocalClient>,
 		shutdown_trigger: signal::ShutdownTrigger,
 		drain_rx: DrainWatcher,
 		dataplane_handle: Handle,
@@ -131,7 +131,7 @@ impl Service {
 			resource_manager,
 			shutdown_trigger,
 			dataplane_handle,
-			load_status,
+			local_client,
 		});
 		let service = AdminService {
 			router: admin_router(state.clone()),
@@ -192,7 +192,7 @@ fn admin_router(state: Arc<AdminState>) -> Router {
 		state.config.clone(),
 		state.model_catalog.clone(),
 		state.resource_manager.clone(),
-		state.load_status.clone(),
+		state.local_client.clone(),
 	));
 	#[cfg(not(feature = "ui"))]
 	let router = router.route("/", get(handle_dashboard));

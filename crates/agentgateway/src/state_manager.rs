@@ -24,7 +24,7 @@ pub struct StateManager {
 	resource_manager: crate::resource_manager::ResourceManager,
 
 	#[serde(skip_serializing)]
-	load_status: SharedLoadStatus,
+	local_client: Option<LocalClient>,
 }
 
 pub const ADDRESS_TYPE: Strng = strng::literal!("type.googleapis.com/istio.workload.Address");
@@ -70,8 +70,7 @@ impl StateManager {
 		} else {
 			None
 		};
-		let load_status = SharedLoadStatus::default();
-		if let Some(cfg) = &xds.local_config {
+		let local_client = if let Some(cfg) = &xds.local_config {
 			let local_client = LocalClient {
 				config: config.clone(),
 				stores: stores.clone(),
@@ -85,15 +84,18 @@ impl StateManager {
 					port: None,
 				},
 				metrics: config_metrics,
-				status: load_status.clone(),
+				status: Default::default(),
 			};
-			Box::pin(local_client.run()).await?;
-		}
+			Box::pin(local_client.clone().run()).await?;
+			Some(local_client)
+		} else {
+			None
+		};
 		Ok(Self {
 			stores,
 			xds_client,
 			resource_manager,
-			load_status,
+			local_client,
 		})
 	}
 
@@ -105,8 +107,8 @@ impl StateManager {
 		self.resource_manager.clone()
 	}
 
-	pub fn load_status(&self) -> SharedLoadStatus {
-		self.load_status.clone()
+	pub fn local_client(&self) -> Option<LocalClient> {
+		self.local_client.clone()
 	}
 
 	pub async fn run(self) -> anyhow::Result<()> {
@@ -117,11 +119,9 @@ impl StateManager {
 	}
 }
 
-pub type SharedLoadStatus = Arc<std::sync::RwLock<LoadStatus>>;
-
 /// LoadStatus reports the outcome of the most recent local config load. It is
 /// written by [`LocalClient`] alongside the `config_synchronized` metric and
-/// read by the config status endpoint.
+/// read via [`LocalClient::load_status`].
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoadStatus {
@@ -129,16 +129,6 @@ pub struct LoadStatus {
 	disk_hash: Option<String>,
 	error: Option<String>,
 	last_updated_at: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-impl LoadStatus {
-	/// Returns a snapshot of the status with `disk_hash` computed from the
-	/// current config source content.
-	pub async fn snapshot(status: &SharedLoadStatus, cfg: &ConfigSource) -> LoadStatus {
-		let mut snapshot = status.read().expect("mutex acquired").clone();
-		snapshot.disk_hash = cfg.read_to_string().await.ok().map(|c| content_hash(&c));
-		snapshot
-	}
 }
 
 fn content_hash(content: &str) -> String {
@@ -161,10 +151,23 @@ pub struct LocalClient {
 	pub resource_manager: crate::resource_manager::ResourceManager,
 	pub gateway: ListenerTarget,
 	pub metrics: Arc<agent_xds::Metrics>,
-	status: SharedLoadStatus,
+	status: Arc<std::sync::RwLock<LoadStatus>>,
 }
 
 impl LocalClient {
+	/// Returns the status of the most recent config load, with `disk_hash`
+	/// computed from the current config source content.
+	pub async fn load_status(&self) -> LoadStatus {
+		let mut status = self.status.read().expect("mutex acquired").clone();
+		status.disk_hash = self
+			.cfg
+			.read_to_string()
+			.await
+			.ok()
+			.map(|c| content_hash(&c));
+		status
+	}
+
 	pub async fn run(self) -> Result<(), anyhow::Error> {
 		let next_state = self.reload_config(PreviousState::default()).await?;
 		if let ConfigSource::File(path) = &self.cfg {
@@ -556,7 +559,7 @@ frontendPolicies:
 		config: Arc<crate::Config>,
 		stores: Stores,
 		resource_manager: crate::resource_manager::ResourceManager,
-		load_status: SharedLoadStatus,
+		local_client: Option<LocalClient>,
 	) -> (std::net::SocketAddr, agent_core::drain::DrainTrigger) {
 		let shutdown = agent_core::signal::Shutdown::new();
 		let (drain_tx, drain_rx) = agent_core::drain::new();
@@ -565,7 +568,7 @@ frontendPolicies:
 			crate::llm::cost::ModelCatalog::empty(),
 			stores,
 			resource_manager,
-			load_status,
+			local_client,
 			shutdown.trigger(),
 			drain_rx,
 			tokio::runtime::Handle::current(),
@@ -610,7 +613,6 @@ frontendPolicies:
 		let client = test_client();
 		let resource_manager =
 			crate::resource_manager::ResourceManager::new(client.clone()).expect("resource manager");
-		let load_status = SharedLoadStatus::default();
 		let local_client = LocalClient {
 			config: config.clone(),
 			cfg: ConfigSource::File(path.to_path_buf()),
@@ -619,14 +621,18 @@ frontendPolicies:
 			resource_manager: resource_manager.clone(),
 			gateway: config.gateway(),
 			metrics: metrics.clone(),
-			status: load_status.clone(),
+			status: Default::default(),
 		};
-		local_client.run().await.expect("initial config load");
+		local_client
+			.clone()
+			.run()
+			.await
+			.expect("initial config load");
 		let (addr, _drain_tx) = spawn_admin(
 			config.clone(),
 			stores.clone(),
 			resource_manager,
-			load_status,
+			Some(local_client),
 		)
 		.await;
 		LiveGateway {
@@ -843,7 +849,7 @@ binds:
 			resource_manager,
 			gateway: config.gateway(),
 			metrics,
-			status: SharedLoadStatus::default(),
+			status: Default::default(),
 		};
 
 		local_client.run().await.unwrap();

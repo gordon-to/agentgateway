@@ -30,7 +30,7 @@ struct App {
 	state: Arc<Config>,
 	resource_manager: crate::resource_manager::ResourceManager,
 	model_catalog: Arc<ModelCatalog>,
-	load_status: crate::state_manager::SharedLoadStatus,
+	local_client: Option<crate::state_manager::LocalClient>,
 }
 
 impl App {
@@ -52,7 +52,7 @@ pub fn router(
 	cfg: Arc<Config>,
 	model_catalog: Arc<ModelCatalog>,
 	resource_manager: crate::resource_manager::ResourceManager,
-	load_status: crate::state_manager::SharedLoadStatus,
+	local_client: Option<crate::state_manager::LocalClient>,
 ) -> Router {
 	let ui_service = tower::service_fn(move |req| serve_ui_asset(req, &ASSETS_DIR));
 	Router::new()
@@ -75,7 +75,7 @@ pub fn router(
 			state: cfg.clone(),
 			resource_manager,
 			model_catalog,
-			load_status,
+			local_client,
 		})
 }
 
@@ -191,10 +191,11 @@ async fn get_config(State(app): State<App>) -> Result<Json<Value>, ErrorResponse
 async fn get_config_status(
 	State(app): State<App>,
 ) -> Result<Json<crate::state_manager::LoadStatus>, ErrorResponse> {
-	let cfg = app.cfg()?;
-	Ok(Json(
-		crate::state_manager::LoadStatus::snapshot(&app.load_status, &cfg).await,
-	))
+	let client = app
+		.local_client
+		.as_ref()
+		.ok_or(ErrorResponse::String("local config not setup".to_string()))?;
+	Ok(Json(client.load_status().await))
 }
 
 async fn write_config(

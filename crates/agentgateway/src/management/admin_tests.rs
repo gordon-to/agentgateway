@@ -18,7 +18,7 @@ async fn spawn_admin(cfg: &str) -> (SocketAddr, agent_core::drain::DrainTrigger)
 		crate::llm::cost::ModelCatalog::empty(),
 		stores,
 		resource_manager,
-		crate::state_manager::SharedLoadStatus::default(),
+		None,
 		shutdown.trigger(),
 		drain_rx,
 		Handle::current(),
