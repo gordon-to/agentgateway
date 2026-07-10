@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { getConfig, getConfigLoadStatus, writeConfig } from "./api/configApi";
+import { getConfig, writeConfig } from "./api/configApi";
 import { getConfigDump } from "./api/configDumpApi";
 import { getRuntimeInfo } from "./api/runtimeApi";
 import { cloneConfig } from "./config";
@@ -13,16 +13,6 @@ export function useGatewayConfig(options?: { enabled?: boolean }) {
     queryFn: getConfig,
     enabled: options?.enabled ?? true,
     retry: false,
-  });
-}
-
-export function useConfigLoadStatus(options?: { enabled?: boolean }) {
-  return useQuery({
-    queryKey: ["config_load_status"],
-    queryFn: getConfigLoadStatus,
-    enabled: options?.enabled ?? true,
-    retry: false,
-    refetchInterval: 10_000,
   });
 }
 
@@ -67,7 +57,6 @@ export function useUpdateConfig() {
       void queryClient.invalidateQueries({ queryKey: ["runtime"] });
       void queryClient.invalidateQueries({ queryKey: ["config_dump"] });
       void queryClient.invalidateQueries({ queryKey: ["config_dump_mode"] });
-      void queryClient.invalidateQueries({ queryKey: ["config_load_status"] });
     },
   });
 }

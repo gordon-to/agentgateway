@@ -121,7 +121,7 @@ pub type SharedLoadStatus = Arc<std::sync::RwLock<LoadStatus>>;
 
 /// LoadStatus reports the outcome of the most recent local config load. It is
 /// written by [`LocalClient`] alongside the `config_synchronized` metric and
-/// read by the admin and UI endpoints.
+/// read by the config status endpoint.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoadStatus {
@@ -720,11 +720,6 @@ binds:
 			status["runningHash"], status["diskHash"],
 			"running and disk hash should diverge after a failed reload: {status}"
 		);
-
-		// /config_dump includes the load status additively
-		let (code, dump) = get_json(format!("http://{}/config_dump", gw.addr)).await;
-		assert_eq!(code, reqwest::StatusCode::OK);
-		assert!(dump["localConfigStatus"]["error"].is_string(), "{dump}");
 	}
 
 	#[cfg(feature = "ui")]

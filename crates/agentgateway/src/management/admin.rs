@@ -70,6 +70,7 @@ struct AdminState {
 	shutdown_trigger: signal::ShutdownTrigger,
 	#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 	dataplane_handle: Handle,
+	#[cfg_attr(not(feature = "ui"), allow(dead_code))]
 	load_status: crate::state_manager::SharedLoadStatus,
 }
 
@@ -90,8 +91,6 @@ pub struct ConfigDump {
 	stores: crate::store::Stores,
 	version: BuildInfo,
 	config: Arc<Config>,
-	#[serde(skip_serializing_if = "Option::is_none")]
-	local_config_status: Option<crate::state_manager::LoadStatus>,
 }
 
 #[derive(serde::Serialize, Debug, Clone, Default)]
@@ -457,15 +456,10 @@ async fn handle_tokio_tasks(
 async fn handle_config_dump(
 	AxumState(state): AxumState<Arc<AdminState>>,
 ) -> Result<Response, AdminError> {
-	let local_config_status = match &state.config.xds.local_config {
-		Some(cfg) => Some(crate::state_manager::LoadStatus::snapshot(&state.load_status, cfg).await),
-		None => None,
-	};
 	let dump = ConfigDump {
 		stores: state.stores.clone(),
 		version: BuildInfo::new(),
 		config: state.config.clone(),
-		local_config_status,
 	};
 	let serde_json::Value::Object(kv) = serde_json::to_value(&dump)? else {
 		return Err(AdminError(anyhow::anyhow!(

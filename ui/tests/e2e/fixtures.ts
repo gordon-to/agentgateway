@@ -220,15 +220,6 @@ export async function mockGateway(
     await route.fallback();
   });
 
-  await page.route("**/api/config/status", async (route) => {
-    await json(route, {
-      runningHash: "sha256:test",
-      diskHash: "sha256:test",
-      error: null,
-      lastUpdatedAt: new Date().toISOString(),
-    });
-  });
-
   await page.route("**/api/logs/search", async (route) => {
     await json(route, {
       logs: [
