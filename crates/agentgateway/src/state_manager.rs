@@ -119,16 +119,40 @@ impl StateManager {
 	}
 }
 
-/// LoadStatus reports the outcome of the most recent local config load. It is
-/// written by [`LocalClient`] alongside the `config_synchronized` metric and
-/// read via [`LocalClient::load_status`].
-#[derive(Debug, Clone, Default, serde::Serialize)]
+/// LoadStatus reports the outcome of the most recent local config load;
+/// `disk_hash` reflects the config source content at read time.
+#[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoadStatus {
-	running_hash: Option<String>,
+	#[serde(flatten)]
+	result: LoadResult,
 	disk_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LoadResult {
+	running_hash: Option<String>,
 	error: Option<String>,
 	last_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl LoadResult {
+	fn success(running_hash: String) -> Self {
+		Self {
+			running_hash: Some(running_hash),
+			error: None,
+			last_updated_at: Some(chrono::Utc::now()),
+		}
+	}
+
+	fn failure(&self, error: String) -> Self {
+		Self {
+			running_hash: self.running_hash.clone(),
+			error: Some(error),
+			last_updated_at: Some(chrono::Utc::now()),
+		}
+	}
 }
 
 fn content_hash(content: &str) -> String {
@@ -140,8 +164,7 @@ fn content_hash(content: &str) -> String {
 }
 
 /// LocalClient loads configuration from a local file or static content and
-/// watches it for changes. Standalone (non-XDS) deployments configure the
-/// gateway through this client.
+/// watches it for changes.
 #[derive(Debug, Clone)]
 pub struct LocalClient {
 	config: Arc<crate::Config>,
@@ -151,21 +174,19 @@ pub struct LocalClient {
 	pub resource_manager: crate::resource_manager::ResourceManager,
 	pub gateway: ListenerTarget,
 	pub metrics: Arc<agent_xds::Metrics>,
-	status: Arc<std::sync::RwLock<LoadStatus>>,
+	status: Arc<std::sync::RwLock<LoadResult>>,
 }
 
 impl LocalClient {
-	/// Returns the status of the most recent config load, with `disk_hash`
-	/// computed from the current config source content.
 	pub async fn load_status(&self) -> LoadStatus {
-		let mut status = self.status.read().expect("mutex acquired").clone();
-		status.disk_hash = self
+		let result = self.status.read().expect("mutex acquired").clone();
+		let disk_hash = self
 			.cfg
 			.read_to_string()
 			.await
 			.ok()
 			.map(|c| content_hash(&c));
-		status
+		LoadStatus { result, disk_hash }
 	}
 
 	pub async fn run(self) -> Result<(), anyhow::Error> {
@@ -266,12 +287,8 @@ impl LocalClient {
 				.discovery
 				.sync_local(config.services, config.workloads, prev.discovery)?;
 
-		{
-			let mut status = self.status.write().expect("mutex acquired");
-			status.running_hash = Some(content_hash(&config_content));
-			status.error = None;
-			status.last_updated_at = Some(chrono::Utc::now());
-		}
+		*self.status.write().expect("mutex acquired") =
+			LoadResult::success(content_hash(&config_content));
 
 		Ok(PreviousState {
 			binds: next_binds,
@@ -291,8 +308,8 @@ impl LocalClient {
 				// Record the error before the gauge flips so observers of the metric see it
 				{
 					let mut status = self.status.write().expect("mutex acquired");
-					status.error = Some(format!("{e:#}"));
-					status.last_updated_at = Some(chrono::Utc::now());
+					let failed = status.failure(format!("{e:#}"));
+					*status = failed;
 				}
 				self.metrics.config_synchronized.set(0);
 				error!("Failed to reload config: {}", e);
@@ -682,9 +699,10 @@ frontendPolicies:
 		wait_for_access_log_remove(&setup.config, &setup.stores, "alpha").await;
 
 		let status = setup.local_client.load_status().await;
-		assert_eq!(status.error, None);
-		assert!(status.last_updated_at.is_some());
+		assert_eq!(status.result.error, None);
+		assert!(status.result.last_updated_at.is_some());
 		let applied_hash = status
+			.result
 			.running_hash
 			.expect("running hash set after successful load");
 		assert!(applied_hash.starts_with("sha256:"));
@@ -696,9 +714,12 @@ frontendPolicies:
 		wait_for_failed_reload(&setup.metrics).await;
 
 		let status = setup.local_client.load_status().await;
-		assert!(status.error.is_some(), "failed reload records an error");
+		assert!(
+			status.result.error.is_some(),
+			"failed reload records an error"
+		);
 		assert_eq!(
-			status.running_hash.as_ref(),
+			status.result.running_hash.as_ref(),
 			Some(&applied_hash),
 			"running hash keeps the last applied config"
 		);
@@ -722,7 +743,6 @@ frontendPolicies:
 		let gw = start_gateway_with_config_file(&path).await;
 		wait_for_access_log_remove(&gw.config, &gw.stores, "alpha").await;
 
-		// While disk and runtime agree, the endpoint reports the applied config
 		let resp = reqwest::get(format!("http://{}/api/config", gw.addr))
 			.await
 			.unwrap();
@@ -741,7 +761,6 @@ binds:
 		fs_err::tokio::write(&path, broken).await.unwrap();
 		wait_for_failed_reload(&gw.metrics).await;
 
-		// The runtime kept the previously applied config
 		let frontend = gw
 			.stores
 			.binds
@@ -766,7 +785,6 @@ binds:
 			"GET /api/config returned the stored file, not the applied config: {body}"
 		);
 
-		// /api/config/status reports the failure and the hash mismatch
 		let (code, status) = get_json(format!("http://{}/api/config/status", gw.addr)).await;
 		assert_eq!(code, reqwest::StatusCode::OK);
 		assert!(
@@ -800,8 +818,6 @@ binds:
 			.unwrap();
 		wait_for_failed_reload(&gw.metrics).await;
 
-		// The gateway still runs the old config: /api/config can only 500, while
-		// /api/config/status still reports the load state
 		let frontend = gw
 			.stores
 			.binds
@@ -858,8 +874,7 @@ binds:
 		assert_eq!(status["runningHash"], status["diskHash"], "{status}");
 		let initial_hash = status["runningHash"].clone();
 
-		// A successful reload moves the running hash to the new content. The store
-		// is synced before the status is written, so poll for the hash to move.
+		// The store syncs before the status write, so poll for the hash to move
 		fs_err::tokio::write(&path, local_config("gamma"))
 			.await
 			.unwrap();
