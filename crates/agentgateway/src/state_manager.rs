@@ -22,6 +22,9 @@ pub struct StateManager {
 
 	#[serde(skip_serializing)]
 	resource_manager: crate::resource_manager::ResourceManager,
+
+	#[serde(skip_serializing)]
+	local_client: Option<LocalClient>,
 }
 
 pub const ADDRESS_TYPE: Strng = strng::literal!("type.googleapis.com/istio.workload.Address");
@@ -67,7 +70,7 @@ impl StateManager {
 		} else {
 			None
 		};
-		if let Some(cfg) = &xds.local_config {
+		let local_client = if let Some(cfg) = &xds.local_config {
 			let local_client = LocalClient {
 				config: config.clone(),
 				stores: stores.clone(),
@@ -81,13 +84,18 @@ impl StateManager {
 					port: None,
 				},
 				metrics: config_metrics,
+				status: Default::default(),
 			};
-			Box::pin(local_client.run()).await?;
-		}
+			Box::pin(local_client.clone().run()).await?;
+			Some(local_client)
+		} else {
+			None
+		};
 		Ok(Self {
 			stores,
 			xds_client,
 			resource_manager,
+			local_client,
 		})
 	}
 
@@ -99,6 +107,10 @@ impl StateManager {
 		self.resource_manager.clone()
 	}
 
+	pub fn local_client(&self) -> Option<LocalClient> {
+		self.local_client.clone()
+	}
+
 	pub async fn run(self) -> anyhow::Result<()> {
 		match self.xds_client {
 			Some(xds) => xds.run().await.map_err(|e| anyhow::anyhow!(e)),
@@ -107,7 +119,52 @@ impl StateManager {
 	}
 }
 
-/// LocalClient serves as a local file reader alternative for XDS. This is intended for testing.
+/// LoadStatus reports the outcome of the most recent local config load;
+/// `disk_hash` reflects the config source content at read time.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadStatus {
+	#[serde(flatten)]
+	result: LoadResult,
+	disk_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LoadResult {
+	running_hash: Option<String>,
+	error: Option<String>,
+	last_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl LoadResult {
+	fn success(running_hash: String) -> Self {
+		Self {
+			running_hash: Some(running_hash),
+			error: None,
+			last_updated_at: Some(chrono::Utc::now()),
+		}
+	}
+
+	fn failure(&self, error: String) -> Self {
+		Self {
+			running_hash: self.running_hash.clone(),
+			error: Some(error),
+			last_updated_at: Some(chrono::Utc::now()),
+		}
+	}
+}
+
+fn content_hash(content: &str) -> String {
+	use sha2::Digest as _;
+	format!(
+		"sha256:{}",
+		hex::encode(sha2::Sha256::digest(content.as_bytes()))
+	)
+}
+
+/// LocalClient loads configuration from a local file or static content and
+/// watches it for changes.
 #[derive(Debug, Clone)]
 pub struct LocalClient {
 	config: Arc<crate::Config>,
@@ -117,9 +174,21 @@ pub struct LocalClient {
 	pub resource_manager: crate::resource_manager::ResourceManager,
 	pub gateway: ListenerTarget,
 	pub metrics: Arc<agent_xds::Metrics>,
+	status: Arc<std::sync::RwLock<LoadResult>>,
 }
 
 impl LocalClient {
+	pub async fn load_status(&self) -> LoadStatus {
+		let result = self.status.read().expect("mutex acquired").clone();
+		let disk_hash = self
+			.cfg
+			.read_to_string()
+			.await
+			.ok()
+			.map(|c| content_hash(&c));
+		LoadStatus { result, disk_hash }
+	}
+
 	pub async fn run(self) -> Result<(), anyhow::Error> {
 		let next_state = self.reload_config(PreviousState::default()).await?;
 		if let ConfigSource::File(path) = &self.cfg {
@@ -218,6 +287,9 @@ impl LocalClient {
 				.discovery
 				.sync_local(config.services, config.workloads, prev.discovery)?;
 
+		*self.status.write().expect("mutex acquired") =
+			LoadResult::success(content_hash(&config_content));
+
 		Ok(PreviousState {
 			binds: next_binds,
 			discovery: next_discovery,
@@ -233,6 +305,12 @@ impl LocalClient {
 				nxt
 			},
 			Err(e) => {
+				// Record the error before the gauge flips so observers of the metric see it
+				{
+					let mut status = self.status.write().expect("mutex acquired");
+					let failed = status.failure(format!("{e:#}"));
+					*status = failed;
+				}
 				self.metrics.config_synchronized.set(0);
 				error!("Failed to reload config: {}", e);
 				prev
@@ -493,6 +571,330 @@ frontendPolicies:
 		assert!(stores.discovery.read().self_workload.get().is_some());
 	}
 
+	#[cfg(feature = "ui")]
+	async fn spawn_admin(
+		config: Arc<crate::Config>,
+		stores: Stores,
+		resource_manager: crate::resource_manager::ResourceManager,
+		local_client: Option<LocalClient>,
+	) -> (std::net::SocketAddr, agent_core::drain::DrainTrigger) {
+		let shutdown = agent_core::signal::Shutdown::new();
+		let (drain_tx, drain_rx) = agent_core::drain::new();
+		let svc = crate::management::admin::Service::new(
+			config,
+			crate::llm::cost::ModelCatalog::empty(),
+			stores,
+			resource_manager,
+			local_client,
+			shutdown.trigger(),
+			drain_rx,
+			tokio::runtime::Handle::current(),
+		)
+		.await
+		.expect("admin server should bind");
+		let addr = svc.address().expect("admin server should have an address");
+		svc.spawn();
+		(addr, drain_tx)
+	}
+
+	async fn wait_for_failed_reload(metrics: &agent_xds::Metrics) {
+		tokio::time::timeout(Duration::from_secs(5), async {
+			while metrics.config_synchronized.get() != 0 {
+				tokio::time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await
+		.expect("timed out waiting for reload failure");
+	}
+
+	struct LocalSetup {
+		config: Arc<crate::Config>,
+		stores: Stores,
+		metrics: Arc<agent_xds::Metrics>,
+		local_client: LocalClient,
+	}
+
+	async fn start_local_client(path: &Path) -> LocalSetup {
+		let mut config =
+			crate::config::parse_config("config:\n  adminAddr: localhost:0\n".to_string(), None)
+				.expect("parse config");
+		config.xds.local_config = Some(ConfigSource::File(path.to_path_buf()));
+		let config = Arc::new(config);
+		let stores = test_stores();
+		let mut registry = prometheus_client::registry::Registry::default();
+		let metrics = Arc::new(agent_xds::Metrics::new(&mut registry));
+		let client = test_client();
+		let resource_manager =
+			crate::resource_manager::ResourceManager::new(client.clone()).expect("resource manager");
+		let local_client = LocalClient {
+			config: config.clone(),
+			cfg: ConfigSource::File(path.to_path_buf()),
+			stores: stores.clone(),
+			client,
+			resource_manager,
+			gateway: config.gateway(),
+			metrics: metrics.clone(),
+			status: Default::default(),
+		};
+		local_client
+			.clone()
+			.run()
+			.await
+			.expect("initial config load");
+		LocalSetup {
+			config,
+			stores,
+			metrics,
+			local_client,
+		}
+	}
+
+	#[cfg(feature = "ui")]
+	struct LiveGateway {
+		config: Arc<crate::Config>,
+		stores: Stores,
+		metrics: Arc<agent_xds::Metrics>,
+		addr: std::net::SocketAddr,
+		_drain_tx: agent_core::drain::DrainTrigger,
+	}
+
+	#[cfg(feature = "ui")]
+	async fn start_gateway_with_config_file(path: &Path) -> LiveGateway {
+		let setup = start_local_client(path).await;
+		let (addr, _drain_tx) = spawn_admin(
+			setup.config.clone(),
+			setup.stores.clone(),
+			setup.local_client.resource_manager.clone(),
+			Some(setup.local_client),
+		)
+		.await;
+		LiveGateway {
+			config: setup.config,
+			stores: setup.stores,
+			metrics: setup.metrics,
+			addr,
+			_drain_tx,
+		}
+	}
+
+	#[cfg(feature = "ui")]
+	async fn get_json(url: String) -> (reqwest::StatusCode, serde_json::Value) {
+		let resp = reqwest::get(url).await.unwrap();
+		let status = resp.status();
+		let body = resp.text().await.unwrap();
+		let value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+		(status, value)
+	}
+
+	// Covers the status logic directly so it runs without the ui feature
+	#[tokio::test]
+	async fn load_status_tracks_reload_success_and_failure() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("config.yaml");
+		fs_err::tokio::write(&path, local_config("alpha"))
+			.await
+			.unwrap();
+
+		let setup = start_local_client(&path).await;
+		wait_for_access_log_remove(&setup.config, &setup.stores, "alpha").await;
+
+		let status = setup.local_client.load_status().await;
+		assert_eq!(status.result.error, None);
+		assert!(status.result.last_updated_at.is_some());
+		let applied_hash = status
+			.result
+			.running_hash
+			.expect("running hash set after successful load");
+		assert!(applied_hash.starts_with("sha256:"));
+		assert_eq!(status.disk_hash.as_ref(), Some(&applied_hash));
+
+		fs_err::tokio::write(&path, "{ this is not yaml [")
+			.await
+			.unwrap();
+		wait_for_failed_reload(&setup.metrics).await;
+
+		let status = setup.local_client.load_status().await;
+		assert!(
+			status.result.error.is_some(),
+			"failed reload records an error"
+		);
+		assert_eq!(
+			status.result.running_hash.as_ref(),
+			Some(&applied_hash),
+			"running hash keeps the last applied config"
+		);
+		assert!(
+			status.disk_hash.is_some_and(|h| h != applied_hash),
+			"disk hash follows the broken file content"
+		);
+	}
+
+	// A failed reload leaves /api/config serving the never-applied stored file;
+	// /api/config/status reports the failure
+	#[cfg(feature = "ui")]
+	#[tokio::test]
+	async fn api_config_returns_unapplied_file_config_after_failed_reload() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("config.yaml");
+		fs_err::tokio::write(&path, local_config("alpha"))
+			.await
+			.unwrap();
+
+		let gw = start_gateway_with_config_file(&path).await;
+		wait_for_access_log_remove(&gw.config, &gw.stores, "alpha").await;
+
+		let resp = reqwest::get(format!("http://{}/api/config", gw.addr))
+			.await
+			.unwrap();
+		assert_eq!(resp.status(), reqwest::StatusCode::OK);
+		assert!(resp.text().await.unwrap().contains("alpha"));
+
+		// Valid yaml that fails validation: a bind without a port must set mode: internal
+		let broken = r#"
+frontendPolicies:
+  accessLog:
+    remove:
+    - beta
+binds:
+- listeners: []
+"#;
+		fs_err::tokio::write(&path, broken).await.unwrap();
+		wait_for_failed_reload(&gw.metrics).await;
+
+		let frontend = gw
+			.stores
+			.binds
+			.read()
+			.frontend_policies(gw.config.gateway_ref());
+		assert!(
+			frontend
+				.access_log
+				.as_ref()
+				.is_some_and(|access_log| access_log.remove.contains("alpha")),
+			"runtime should still run the last successfully applied config"
+		);
+
+		// /api/config keeps returning the stored file for backwards compatibility
+		let resp = reqwest::get(format!("http://{}/api/config", gw.addr))
+			.await
+			.unwrap();
+		assert_eq!(resp.status(), reqwest::StatusCode::OK);
+		let body = resp.text().await.unwrap();
+		assert!(
+			body.contains("beta") && !body.contains("alpha"),
+			"GET /api/config returned the stored file, not the applied config: {body}"
+		);
+
+		let (code, status) = get_json(format!("http://{}/api/config/status", gw.addr)).await;
+		assert_eq!(code, reqwest::StatusCode::OK);
+		assert!(
+			status["error"].is_string(),
+			"load error should be reported: {status}"
+		);
+		assert!(
+			status["runningHash"].is_string() && status["diskHash"].is_string(),
+			"{status}"
+		);
+		assert_ne!(
+			status["runningHash"], status["diskHash"],
+			"running and disk hash should diverge after a failed reload: {status}"
+		);
+	}
+
+	#[cfg(feature = "ui")]
+	#[tokio::test]
+	async fn api_config_errors_when_stored_config_is_unparseable() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("config.yaml");
+		fs_err::tokio::write(&path, local_config("alpha"))
+			.await
+			.unwrap();
+
+		let gw = start_gateway_with_config_file(&path).await;
+		wait_for_access_log_remove(&gw.config, &gw.stores, "alpha").await;
+
+		fs_err::tokio::write(&path, "{ this is not yaml [")
+			.await
+			.unwrap();
+		wait_for_failed_reload(&gw.metrics).await;
+
+		let frontend = gw
+			.stores
+			.binds
+			.read()
+			.frontend_policies(gw.config.gateway_ref());
+		assert!(
+			frontend
+				.access_log
+				.as_ref()
+				.is_some_and(|access_log| access_log.remove.contains("alpha")),
+			"runtime should still run the last successfully applied config"
+		);
+
+		let resp = reqwest::get(format!("http://{}/api/config", gw.addr))
+			.await
+			.unwrap();
+		assert_eq!(
+			resp.status(),
+			reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+			"GET /api/config cannot report anything about the running config once the file is corrupt"
+		);
+
+		let (code, status) = get_json(format!("http://{}/api/config/status", gw.addr)).await;
+		assert_eq!(code, reqwest::StatusCode::OK);
+		assert!(
+			status["error"].is_string(),
+			"load status must survive a corrupt stored file: {status}"
+		);
+		assert!(status["runningHash"].is_string(), "{status}");
+	}
+
+	#[cfg(feature = "ui")]
+	#[tokio::test]
+	async fn api_config_status_reports_matching_hashes_when_synced() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("config.yaml");
+		fs_err::tokio::write(&path, local_config("alpha"))
+			.await
+			.unwrap();
+
+		let gw = start_gateway_with_config_file(&path).await;
+		wait_for_access_log_remove(&gw.config, &gw.stores, "alpha").await;
+
+		let (code, status) = get_json(format!("http://{}/api/config/status", gw.addr)).await;
+		assert_eq!(code, reqwest::StatusCode::OK);
+		assert!(status["error"].is_null(), "{status}");
+		assert!(status["lastUpdatedAt"].is_string(), "{status}");
+		assert!(
+			status["runningHash"]
+				.as_str()
+				.is_some_and(|h| h.starts_with("sha256:")),
+			"{status}"
+		);
+		assert_eq!(status["runningHash"], status["diskHash"], "{status}");
+		let initial_hash = status["runningHash"].clone();
+
+		// The store syncs before the status write, so poll for the hash to move
+		fs_err::tokio::write(&path, local_config("gamma"))
+			.await
+			.unwrap();
+		wait_for_access_log_remove(&gw.config, &gw.stores, "gamma").await;
+
+		let status = tokio::time::timeout(Duration::from_secs(5), async {
+			loop {
+				let (_, status) = get_json(format!("http://{}/api/config/status", gw.addr)).await;
+				if status["runningHash"].is_string() && status["runningHash"] != initial_hash {
+					return status;
+				}
+				tokio::time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await
+		.expect("timed out waiting for running hash to advance");
+		assert!(status["error"].is_null(), "{status}");
+		assert_eq!(status["runningHash"], status["diskHash"], "{status}");
+	}
+
 	#[tokio::test]
 	async fn file_config_reloads_after_repeated_rename_replacement() {
 		let dir = tempfile::tempdir().unwrap();
@@ -517,6 +919,7 @@ frontendPolicies:
 			resource_manager,
 			gateway: config.gateway(),
 			metrics,
+			status: Default::default(),
 		};
 
 		local_client.run().await.unwrap();

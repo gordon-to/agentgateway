@@ -70,6 +70,8 @@ struct AdminState {
 	shutdown_trigger: signal::ShutdownTrigger,
 	#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 	dataplane_handle: Handle,
+	#[cfg_attr(not(feature = "ui"), allow(dead_code))]
+	local_client: Option<crate::state_manager::LocalClient>,
 }
 
 pub struct Service {
@@ -111,11 +113,13 @@ pub struct CertsDump {
 }
 
 impl Service {
+	#[allow(clippy::too_many_arguments)]
 	pub async fn new(
 		config: Arc<Config>,
 		model_catalog: Arc<crate::llm::cost::ModelCatalog>,
 		stores: crate::store::Stores,
 		resource_manager: crate::resource_manager::ResourceManager,
+		local_client: Option<crate::state_manager::LocalClient>,
 		shutdown_trigger: signal::ShutdownTrigger,
 		drain_rx: DrainWatcher,
 		dataplane_handle: Handle,
@@ -127,6 +131,7 @@ impl Service {
 			resource_manager,
 			shutdown_trigger,
 			dataplane_handle,
+			local_client,
 		});
 		let service = AdminService {
 			router: admin_router(state.clone()),
@@ -187,6 +192,7 @@ fn admin_router(state: Arc<AdminState>) -> Router {
 		state.config.clone(),
 		state.model_catalog.clone(),
 		state.resource_manager.clone(),
+		state.local_client.clone(),
 	));
 	#[cfg(not(feature = "ui"))]
 	let router = router.route("/", get(handle_dashboard));

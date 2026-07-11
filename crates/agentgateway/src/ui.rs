@@ -30,6 +30,7 @@ struct App {
 	state: Arc<Config>,
 	resource_manager: crate::resource_manager::ResourceManager,
 	model_catalog: Arc<ModelCatalog>,
+	local_client: Option<crate::state_manager::LocalClient>,
 }
 
 impl App {
@@ -51,12 +52,14 @@ pub fn router(
 	cfg: Arc<Config>,
 	model_catalog: Arc<ModelCatalog>,
 	resource_manager: crate::resource_manager::ResourceManager,
+	local_client: Option<crate::state_manager::LocalClient>,
 ) -> Router {
 	let ui_service = tower::service_fn(move |req| serve_ui_asset(req, &ASSETS_DIR));
 	Router::new()
 		// Redirect to the UI
 		.route("/api/runtime", get(get_runtime))
 		.route("/api/config", get(get_config).post(write_config))
+		.route("/api/config/status", get(get_config_status))
 		// Legacy path
 		.route("/cel", axum::routing::post(handle_cel))
 		.route("/api/cel", axum::routing::post(handle_cel))
@@ -72,6 +75,7 @@ pub fn router(
 			state: cfg.clone(),
 			resource_manager,
 			model_catalog,
+			local_client,
 		})
 }
 
@@ -182,6 +186,16 @@ async fn get_config(State(app): State<App>) -> Result<Json<Value>, ErrorResponse
 	let s = app.cfg()?.read_to_string().await?;
 	let v: Value = yamlviajson::from_str(&s).map_err(|e| ErrorResponse::Anyhow(e.into()))?;
 	Ok(Json(v))
+}
+
+async fn get_config_status(
+	State(app): State<App>,
+) -> Result<Json<crate::state_manager::LoadStatus>, ErrorResponse> {
+	let client = app
+		.local_client
+		.as_ref()
+		.ok_or(ErrorResponse::String("local config not setup".to_string()))?;
+	Ok(Json(client.load_status().await))
 }
 
 async fn write_config(

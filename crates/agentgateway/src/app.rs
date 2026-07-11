@@ -89,6 +89,7 @@ pub async fn run(config: Arc<Config>) -> anyhow::Result<Bound> {
 	.await?;
 	let stores = state_mgr.stores();
 	let resource_manager = state_mgr.resource_manager();
+	let local_client = state_mgr.local_client();
 
 	state_manager::start_self_workload_resolution(&config, stores.clone(), &ready);
 
@@ -108,6 +109,7 @@ pub async fn run(config: Arc<Config>) -> anyhow::Result<Bound> {
 		model_catalog.clone(),
 		stores.clone(),
 		resource_manager,
+		local_client,
 		shutdown.trigger(),
 		drain_rx.clone(),
 		data_plane_handle.clone(),
