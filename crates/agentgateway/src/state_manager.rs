@@ -580,7 +580,6 @@ frontendPolicies:
 		(addr, drain_tx)
 	}
 
-	#[cfg(feature = "ui")]
 	async fn wait_for_failed_reload(metrics: &agent_xds::Metrics) {
 		tokio::time::timeout(Duration::from_secs(5), async {
 			while metrics.config_synchronized.get() != 0 {
@@ -591,17 +590,14 @@ frontendPolicies:
 		.expect("timed out waiting for reload failure");
 	}
 
-	#[cfg(feature = "ui")]
-	struct LiveGateway {
+	struct LocalSetup {
 		config: Arc<crate::Config>,
 		stores: Stores,
 		metrics: Arc<agent_xds::Metrics>,
-		addr: std::net::SocketAddr,
-		_drain_tx: agent_core::drain::DrainTrigger,
+		local_client: LocalClient,
 	}
 
-	#[cfg(feature = "ui")]
-	async fn start_gateway_with_config_file(path: &Path) -> LiveGateway {
+	async fn start_local_client(path: &Path) -> LocalSetup {
 		let mut config =
 			crate::config::parse_config("config:\n  adminAddr: localhost:0\n".to_string(), None)
 				.expect("parse config");
@@ -618,7 +614,7 @@ frontendPolicies:
 			cfg: ConfigSource::File(path.to_path_buf()),
 			stores: stores.clone(),
 			client,
-			resource_manager: resource_manager.clone(),
+			resource_manager,
 			gateway: config.gateway(),
 			metrics: metrics.clone(),
 			status: Default::default(),
@@ -628,17 +624,37 @@ frontendPolicies:
 			.run()
 			.await
 			.expect("initial config load");
-		let (addr, _drain_tx) = spawn_admin(
-			config.clone(),
-			stores.clone(),
-			resource_manager,
-			Some(local_client),
-		)
-		.await;
-		LiveGateway {
+		LocalSetup {
 			config,
 			stores,
 			metrics,
+			local_client,
+		}
+	}
+
+	#[cfg(feature = "ui")]
+	struct LiveGateway {
+		config: Arc<crate::Config>,
+		stores: Stores,
+		metrics: Arc<agent_xds::Metrics>,
+		addr: std::net::SocketAddr,
+		_drain_tx: agent_core::drain::DrainTrigger,
+	}
+
+	#[cfg(feature = "ui")]
+	async fn start_gateway_with_config_file(path: &Path) -> LiveGateway {
+		let setup = start_local_client(path).await;
+		let (addr, _drain_tx) = spawn_admin(
+			setup.config.clone(),
+			setup.stores.clone(),
+			setup.local_client.resource_manager.clone(),
+			Some(setup.local_client),
+		)
+		.await;
+		LiveGateway {
+			config: setup.config,
+			stores: setup.stores,
+			metrics: setup.metrics,
 			addr,
 			_drain_tx,
 		}
@@ -651,6 +667,45 @@ frontendPolicies:
 		let body = resp.text().await.unwrap();
 		let value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
 		(status, value)
+	}
+
+	// Covers the status logic directly so it runs without the ui feature
+	#[tokio::test]
+	async fn load_status_tracks_reload_success_and_failure() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("config.yaml");
+		fs_err::tokio::write(&path, local_config("alpha"))
+			.await
+			.unwrap();
+
+		let setup = start_local_client(&path).await;
+		wait_for_access_log_remove(&setup.config, &setup.stores, "alpha").await;
+
+		let status = setup.local_client.load_status().await;
+		assert_eq!(status.error, None);
+		assert!(status.last_updated_at.is_some());
+		let applied_hash = status
+			.running_hash
+			.expect("running hash set after successful load");
+		assert!(applied_hash.starts_with("sha256:"));
+		assert_eq!(status.disk_hash.as_ref(), Some(&applied_hash));
+
+		fs_err::tokio::write(&path, "{ this is not yaml [")
+			.await
+			.unwrap();
+		wait_for_failed_reload(&setup.metrics).await;
+
+		let status = setup.local_client.load_status().await;
+		assert!(status.error.is_some(), "failed reload records an error");
+		assert_eq!(
+			status.running_hash.as_ref(),
+			Some(&applied_hash),
+			"running hash keeps the last applied config"
+		);
+		assert!(
+			status.disk_hash.is_some_and(|h| h != applied_hash),
+			"disk hash follows the broken file content"
+		);
 	}
 
 	// A failed reload leaves /api/config serving the never-applied stored file;
